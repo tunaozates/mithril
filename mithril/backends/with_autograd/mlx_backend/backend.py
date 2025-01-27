@@ -12,46 +12,64 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from collections.abc import Callable, Sequence
-from functools import partial
 from typing import Any, overload
 
-import mlx.core as mx
-import mlx.nn as nn
-
+import jax
+import jax.numpy as jnp
 from ....core import Dtype
-from ...backend import Backend, PadWidthType
+from ...backend import PadWidthType, ParallelBackend
 from ...utils import DtypeSubTypes, StaticScalar, process_shape
 from . import ops, utils
+from .parallel import JaxParallel
 from .utils import CODEGEN_CONFIG
 
-__all__ = ["MlxBackend"]
-AxisType = None | int | Sequence[int]
+__all__ = ["JaxBackend"]
+
+jax.config.update("jax_enable_x64", True)  # type: ignore
 
 
-class MlxBackend(Backend[mx.array]):
-    backend_type = "mlx"
-    supported_dtypes = [Dtype.float16, Dtype.bfloat16, Dtype.float32]
-    registered_primitives: dict[str, Callable[..., mx.array]] = {}
-    primitive_fn_path = "mithril.backends.with_autograd.mlx_backend.ops"
+class JaxBackend(ParallelBackend[jax.numpy.ndarray]):
+    """JaxBackend: A backend implementation for the Mithril library using Jax.
+
+    Parameters
+    ----------
+    device: str, optional
+        The device on which to perform computations, default is "cpu".
+    precision: int, optional
+        The precision of the arrays, either 32 or 64, default is 32.
+    pre_allocate: bool, optional
+        This argument controls whether JAX pre-allocates memory, default is False.
+    """
+
+    backend_type = "jax"
+    registered_primitives: dict[str, Callable[..., jax.numpy.ndarray]] = {}
+    primitive_fn_path = "mithril.backends.with_autograd.jax_backend.ops"
 
     def __init__(
         self,
         device: str = "cpu",
         dtype: Dtype = Dtype.float32,
-        eager_free: bool = False,
+        pre_allocate: bool = False,
+        device_mesh: tuple[int, ...] | None = None,
     ) -> None:
-        if eager_free:
-            os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-
-        self._dtype = dtype
         self._device = device
-        super().__init__(dtype=dtype)
+        utils.get_device(device)  # Check device is available
+        self._dtype = dtype
+        self._parallel_manager: JaxParallel | None = None
+
+        super().__init__(dtype=dtype, device_mesh=device_mesh)
+
+        if device_mesh is not None:
+            self._create_parallel(device_mesh=device_mesh)
+
+        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = str(pre_allocate).lower()
 
         self.array_creation_funcs = ops.array_creation_funcs
         self.primitive_function_dict = ops.primitive_func_dict
-        self.prng_key = mx.random.key(self.seed)
+        self.prng_key = jax.random.PRNGKey(self.seed)
 
         for key, value in utils.dtype_map.items():
             setattr(self, key, value)
@@ -62,184 +80,222 @@ class MlxBackend(Backend[mx.array]):
 
     @property
     def inf(self) -> float:
-        return mx.inf
+        return jax.numpy.inf
 
     @property
     def nan(self) -> float:
-        return mx.nan
+        return jax.numpy.nan
+
+    def get_backend_array_type(self) -> type[jax.Array]:
+        return jax.Array
 
     @property
-    def device(self) -> Any:
-        utils.get_device(self._device)
+    def device(self) -> jax.Device:
+        return utils.get_device(self._device)
+
+    def get_device(self) -> Any:
+        return self._device
+
+    # TODO: This property is weird! Investigate why this property is used.
+    @property
+    def DataType(self) -> type[jax.Array]:  # noqa: N802
+        return utils.ArrayType
 
     @property
     def codegen_config(self) -> dict[str, bool]:
         return CODEGEN_CONFIG
 
-    def get_device(self) -> Any:
-        return self._device
-
-    @property
-    def DataType(self) -> type[mx.array]:  # noqa: N802
-        return utils.ArrayType
-
-    # TODO: This property is weird! Investigate why this property is used.
-
-    def get_backend_array_type(self) -> type[mx.array]:
-        return mx.array
-
     @staticmethod
     def get_available_devices() -> list[str]:
+        """Static method to get a list of available devices.
+
+        Parameters
+        ----------
+        list[str]
+            List of available devices.
+        """
         return utils.get_available_devices()
 
     @staticmethod
-    def register_primitive(fn: Callable[..., mx.array]) -> None:
-        MlxBackend.registered_primitives[fn.__name__] = fn
+    def register_primitive(fn: Callable[..., Any]) -> None:
+        JaxBackend.registered_primitives[fn.__name__] = fn
 
     def set_seed(self, seed: int) -> None:
         self.seed = seed
-        self.prng_key = mx.random.key(seed)
-
-    def argmax(
-        self, input: mx.array, *, axis: AxisType = None, keepdim: bool = False
-    ) -> mx.array:
-        return mx.argmax(input, axis=axis, keepdims=keepdim)
+        self.prng_key = jax.random.PRNGKey(seed)
 
     def to_device(
-        self, data: mx.array, device: str, asynchronous: bool = True
-    ) -> mx.array:
-        return data
+        self, data: jax.Array, device: str, asynchronous: bool = True
+    ) -> jax.Array:
+        """Move data to the specified device.
 
-    def block_until_ready(self, data: mx.array) -> None:
-        mx.eval(data)
+        Parameters
+        ----------
+        data: jax.Array
+            The data to be moved to the specified device.
+        device: str
+            The target device for the data.
+        """
+        _device = utils.get_device(device)
+        if not asynchronous:
+            return jax.device_put(data, device=_device).block_until_ready()
+        return jax.device_put(data, device=_device)
 
-    def _handle_dict_type_fun(
+    def block_until_ready(self, data: jax.Array) -> jax.Array | None:
+        """Block until the specified data is ready.
+
+        Parameters
+        ----------
+        data: jax.Array
+            The data for which the method will block until it is ready.
+        """
+        return data.block_until_ready()
+
+    def register_callable(
+        self, fn: Callable[..., Any], fn_name: str, jit: bool = False
+    ) -> None:
+        assert (
+            self._parallel_manager is not None
+        ), "Parallel manager is not initialized!"
+
+        fn_name = str(id(self)) + fn_name
+        return self._parallel_manager.register_callable(fn, fn_name, jit)
+
+    def _run_callable(self, *primals: jax.Array, fn_name: str) -> Any:
+        assert (
+            self._parallel_manager is not None
+        ), "Parallel manager is not initialized!"
+
+        fn_name = str(id(self)) + fn_name
+        return self._parallel_manager.run_callable(*primals, fn_name=fn_name)
+
+    def _create_parallel(self, device_mesh: tuple[int, ...]) -> None:
+        self._parallel_manager = JaxParallel(math.prod(device_mesh), self._device)
+
+    def array(
         self,
-        *inputs: mx.array,
-        keys: list[str],
-        cotangent_keys: list[str],
-        fn: Callable[..., Any],
-        output_keys: list[str],
-        has_aux: bool,
-    ) -> list[mx.array]:
-        # Used for MLX to convert inputs to list
-        input_dict = {}
-        for key, input in zip(keys, inputs, strict=False):
-            input_dict[key] = input
-
-        _output = fn(input_dict)
-        if has_aux:
-            # This means function has auxilary outputs
-            output, aux = _output
-            # In case function has auxilary outputs,
-            # cotangent keys must include all output keys.
-            if list(output.keys()) != cotangent_keys:
-                raise KeyError(
-                    "Output keys must match with cotangent keys when has_aux = True"
-                )
-        else:
-            output = _output
-            aux = dict()
-        output_keys += list(output.keys()) + list(aux.keys())
-        return [output[key] for key in cotangent_keys] + [
-            self.stop_gradient(value) for value in aux.values()
-        ]
-
-    def _handle_sequence_type_fun(
-        self,
-        *inputs: mx.array,
-        cotangents: Sequence[mx.array] | mx.array,
-        fn: Callable[..., Any],
-        has_aux: bool,
-    ) -> list[mx.array]:
-        _output = fn(*inputs)
-
-        if has_aux:
-            # This means function has auxilary outputs
-            output, aux = _output
-            # In case function has auxilary outputs,
-            # length of cotangent must be consistent with output.
-            if (
-                isinstance(output, mx.array)
-                and not isinstance(cotangents, mx.array)
-                or isinstance(output, Sequence)
-                and (
-                    not isinstance(cotangents, Sequence)
-                    or len(output) != len(cotangents)
-                )
-            ):
-                raise KeyError(
-                    "Output type and length must match with cotangent type and \
-                    length when has_aux = True"
-                )
-
-            if isinstance(aux, mx.array):
-                aux = [aux]
-            elif isinstance(aux, tuple):
-                aux = list(aux)
-        else:
-            output = _output
-            aux = list()
-
-        if isinstance(output, Sequence):
-            output = list(output)
-            return [
-                value if idx < len(cotangents) else self.stop_gradient(value)
-                for idx, value in enumerate(output + aux)
-            ]
-        return [output]
-
-    def array(self, input: Any, *, dtype: Dtype | None = None) -> mx.array:
+        input: Any,
+        *,
+        dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
         _dtype = utils.determine_dtype(input, dtype, self._dtype, self.precision)
-        return mx.array(input, dtype=utils.dtype_map[_dtype])
+
+        with jax.default_device(self.device):
+            array = jax.numpy.array(input, dtype=utils.dtype_map[_dtype])
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def zeros(
-        self, *shape: int | tuple[int, ...] | list[int], dtype: Dtype | None = None
-    ) -> mx.array:
+        self,
+        *shape: int | tuple[int, ...] | list[int],
+        dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
         _dtype = self._process_dtype(dtype)
         _shape = process_shape(shape)
-        return mx.zeros(_shape, dtype=_dtype)
+
+        with jax.default_device(self.device):
+            array = jax.numpy.zeros(_shape, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def ones(
-        self, *shape: int | tuple[int, ...] | list[int], dtype: Dtype | None = None
-    ) -> mx.array:
+        self,
+        *shape: int | tuple[int, ...] | list[int],
+        dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
         _dtype = self._process_dtype(dtype)
         _shape = process_shape(shape)
-        return mx.ones(_shape, dtype=_dtype)
 
-    def ones_like(self, input: mx.array, *, dtype: Dtype | None = None) -> mx.array:
-        if dtype is not None:
-            raise ValueError("dtype argument is not supported for ones_like")
+        with jax.default_device(self.device):
+            array = jax.numpy.ones(_shape, dtype=_dtype)
 
-        return mx.ones_like(input)
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
 
-    def zeros_like(self, input: mx.array, *, dtype: Dtype | None = None) -> mx.array:
-        if dtype is not None:
-            raise ValueError("dtype argument is not supported for ones_like")
+        return array
 
-        return mx.zeros_like(input)
+    def ones_like(
+        self,
+        input: jax.Array,
+        *,
+        dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
+        _dtype = self._process_dtype(dtype) if dtype is not None else None
+
+        with jax.default_device(self.device):
+            array = jax.numpy.ones_like(input, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
+
+    def zeros_like(
+        self,
+        input: jax.Array,
+        *,
+        dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
+        _dtype = self._process_dtype(dtype) if dtype is not None else None
+
+        with jax.default_device(self.device):
+            array = jax.numpy.zeros_like(input, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def randn(
         self,
         *shape: int | tuple[int, ...] | list[int],
         dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
         key: int | None = None,
-    ) -> mx.array:
+    ) -> jax.Array:
         prng_key = self._get_prng_key(key)
+
         _dtype = self._process_dtype(dtype)
         _shape = process_shape(shape)
-        return mx.random.normal(shape=_shape, dtype=_dtype, key=prng_key)
+
+        with jax.default_device(self.device):
+            array = jax.random.normal(prng_key, _shape, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def rand(
         self,
         *shape: int | tuple[int, ...] | list[int],
         dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
         key: int | None = None,
-    ) -> mx.array:
+    ) -> jax.Array:
         prng_key = self._get_prng_key(key)
+
         _dtype = self._process_dtype(dtype)
         _shape = process_shape(shape)
-        return mx.random.uniform(shape=_shape, dtype=_dtype, key=prng_key)
+
+        with jax.default_device(self.device):
+            array = jax.random.normal(prng_key, _shape, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def randint(
         self,
@@ -247,25 +303,43 @@ class MlxBackend(Backend[mx.array]):
         high: int,
         *shape: int | tuple[int, ...] | list[int],
         dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
         key: int | None = None,
-    ) -> mx.array:
+    ) -> jax.Array:
         prng_key = self._get_prng_key(key)
+
         _dtype = self._process_dtype(dtype, "int")
         _shape = process_shape(shape)
-        return mx.random.randint(low, high, shape=_shape, dtype=_dtype, key=prng_key)
+
+        with jax.default_device(self.device):
+            array = jax.random.randint(prng_key, _shape, low, high, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def rand_uniform(
         self,
-        low: int | float | bool | mx.array,
-        high: int | float | bool | mx.array,
+        low: int | float | bool | jax.numpy.ndarray,
+        high: int | float | bool | jax.numpy.ndarray,
         *shape: int | tuple[int, ...] | list[int],
         dtype: Dtype | None = None,
+        device_mesh: tuple[int, ...] | None = None,
         key: int | None = None,
-    ) -> mx.array:
+    ) -> jax.Array:
         prng_key = self._get_prng_key(key)
+
         _dtype = self._process_dtype(dtype)
         _shape = process_shape(shape)
-        return mx.random.uniform(low, high, shape=_shape, dtype=_dtype, key=prng_key)
+
+        with jax.default_device(self.device):
+            array = jax.random.uniform(prng_key, _shape, _dtype, low, high)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def _arange(
         self,
@@ -273,139 +347,159 @@ class MlxBackend(Backend[mx.array]):
         stop: int | float,
         step: int | float,
         dtype: Dtype | None = None,
-    ) -> mx.array:
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
         default_type = (
             "float" if any(isinstance(x, float) for x in (start, stop, step)) else "int"
         )
         _dtype = self._process_dtype(dtype, default_type)
 
-        return mx.arange(start, stop, step, dtype=_dtype)
+        with jax.default_device(self.device):
+            array = jax.numpy.arange(start, stop, step, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def linspace(
         self,
-        start: int | float | bool | mx.array,
-        stop: int | float | bool | mx.array,
+        start: int | float | bool | jax.numpy.ndarray,
+        stop: int | float | bool | jax.numpy.ndarray,
         steps: int,
         dtype: Dtype | None = None,
-    ) -> mx.array:
+        device_mesh: tuple[int, ...] | None = None,
+    ) -> jax.Array:
         _dtype = self._process_dtype(dtype)
-        return mx.linspace(start, stop, steps, dtype=_dtype)
+        with jax.default_device(self.device):
+            array = jax.numpy.linspace(start, stop, steps, dtype=_dtype)
+
+        if self._parallel_manager is not None:
+            array = self._parallel_manager.parallelize(array, device_mesh)
+
+        return array
 
     def flatten(
-        self, input: mx.array, start_dim: int = 0, end_dim: int = -1
-    ) -> mx.array:
-        return mx.flatten(input, start_axis=start_dim, end_axis=end_dim)
+        self, input: jax.Array, start_dim: int = 0, end_dim: int = -1
+    ) -> jax.Array:
+        return ops.flatten(input, start_dim=start_dim, end_dim=end_dim)
 
-    def abs(self, input: mx.array) -> mx.array:
-        return mx.abs(input)
+    def abs(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.abs(input)
 
-    def sign(self, input: mx.array) -> mx.array:
-        return mx.sign(input)
+    def sign(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.sign(input)
 
-    def sin(self, input: mx.array) -> mx.array:
-        return mx.sin(input)
+    def sin(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.sin(input)
 
-    def cos(self, input: mx.array) -> mx.array:
-        return mx.cos(input)
+    def cos(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.cos(input)
 
-    def tanh(self, input: mx.array) -> mx.array:
-        return mx.tanh(input)
+    def tanh(self, input: jax.Array) -> jax.Array:
+        return jax.nn.tanh(input)
 
-    def relu(self, input: mx.array) -> mx.array:
-        return nn.relu(input)
+    def relu(self, input: jax.Array) -> jax.Array:
+        return jax.nn.relu(input)
 
-    def leaky_relu(self, input: mx.array, slope: float | mx.array) -> mx.array:
-        return nn.leaky_relu(input, slope)
+    def leaky_relu(self, input: jax.Array, slope: float | jax.Array) -> jax.Array:
+        return jax.nn.leaky_relu(input, slope)
 
-    def sigmoid(self, input: mx.array) -> mx.array:
-        return nn.sigmoid(input)
+    def sigmoid(self, input: jax.Array) -> jax.Array:
+        return jax.nn.sigmoid(input)
 
-    def softplus(self, input: mx.array) -> mx.array:
-        return nn.softplus(input)
+    def softplus(self, input: jax.Array) -> jax.Array:
+        return jax.nn.softplus(input)
 
-    def softmax(self, input: mx.array, dim: int = -1) -> mx.array:
+    def softmax(self, input: jax.Array, dim: int = -1) -> jax.Array:
         # TODO: dim can be Sequence[int] as well. Should work
         # for all backends.
-        return nn.softmax(input, axis=dim)
+        return ops.softmax(input, axis=dim)
 
-    def log(self, input: mx.array) -> mx.array:
-        return mx.log(input)
+    def argmax(
+        self, input: jax.Array, axis: int | None = None, keepdim: bool = False
+    ) -> jax.Array:
+        return jnp.argmax(input, axis=axis, keepdims=keepdim)
 
-    def isnan(self, input: mx.array) -> mx.array:
-        return mx.isnan(input)
+    def log(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.log(input)
 
-    def stop_gradient(self, input: mx.array) -> mx.array:
-        return mx.stop_gradient(input)
+    def isnan(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.isnan(input)
 
-    def squeeze(self, input: mx.array) -> mx.array:
-        return mx.squeeze(input)
+    def stop_gradient(self, input: jax.Array) -> jax.Array:
+        return jax.lax.stop_gradient(input)
 
-    def reshape(self, input: mx.array, shape: tuple[int, ...]) -> mx.array:
-        return mx.reshape(input, shape)
+    def squeeze(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.squeeze(input)
+
+    def reshape(self, input: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+        return jax.numpy.reshape(input, shape)
 
     def sort(
-        self, input: mx.array, axis: int = -1, descending: bool = False
-    ) -> mx.array:
-        result = mx.sort(input, axis)
-        if descending:
-            result = -result
-        return result
+        self, input: jax.Array, axis: int = -1, descending: bool = False
+    ) -> jax.Array:
+        return jax.numpy.sort(input, axis, descending=descending)
 
-    def expand_dims(self, input: mx.array, axis: int) -> mx.array:
-        return mx.expand_dims(input, axis)
+    def expand_dims(self, input: jax.Array, axis: int) -> jax.Array:
+        return jax.numpy.expand_dims(input, axis)
 
-    def stack(self, inputs: list[mx.array], axis: int = 0) -> mx.array:
-        return mx.stack(inputs, axis=axis)
+    def stack(self, inputs: list[jax.Array], axis: int = 0) -> jax.Array:
+        return jax.numpy.stack(inputs, axis=axis)
 
     def cat(
-        self, inputs: tuple[mx.array, ...] | list[mx.array], axis: int = 0
-    ) -> mx.array:
-        inputs = list(inputs)
-        return mx.concatenate(inputs, axis=axis)
+        self, inputs: tuple[jax.Array, ...] | list[jax.Array], axis: int = 0
+    ) -> jax.Array:
+        return ops.concat(*inputs, axis=axis)
 
-    def pad(self, input: mx.array, pad_width: PadWidthType) -> mx.array:
-        return mx.pad(input, pad_width)
+    def pad(self, input: jax.Array, pad_width: PadWidthType) -> jax.Array:
+        return jax.numpy.pad(input, pad_width)
 
-    def all(self, input: mx.array) -> mx.array:
-        return mx.all(input)
+    def all(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.all(input)
 
-    def any(self, input: mx.array) -> mx.array:
-        return mx.any(input)
+    def any(self, input: jax.Array) -> jax.Array:
+        return jax.numpy.any(input)
 
     def atleast_1d(
-        self, inputs: mx.array | tuple[mx.array, ...]
-    ) -> mx.array | tuple[mx.array, ...]:
+        self, inputs: jax.Array | tuple[jax.Array, ...]
+    ) -> jax.Array | list[jax.Array]:
         if isinstance(inputs, tuple):
-            return mx.atleast_1d(*inputs)
+            return jax.numpy.atleast_1d(*inputs)
         else:
-            return mx.atleast_1d(inputs)
+            return jax.numpy.atleast_1d(inputs)
 
     def atleast_2d(
-        self, inputs: mx.array | tuple[mx.array, ...]
-    ) -> mx.array | tuple[mx.array, ...]:
+        self, inputs: jax.Array | tuple[jax.Array, ...]
+    ) -> jax.Array | list[jax.Array]:
         if isinstance(inputs, tuple):
-            return mx.atleast_2d(*inputs)
+            return jax.numpy.atleast_2d(*inputs)
         else:
-            return mx.atleast_2d(inputs)
+            return jax.numpy.atleast_2d(inputs)
 
     def transpose(
-        self, input: mx.array, axes: tuple[int, ...] | list[int] | None = None
-    ) -> mx.array:
-        return ops.transpose(input, axes)
+        self, input: jax.Array, axes: tuple[int, ...] | list[int] | None = None
+    ) -> jax.Array:
+        return input.transpose(axes)
 
-    def where(self, cond: mx.array, input1: mx.array, input2: mx.array) -> mx.array:
-        return mx.where(cond, input1, input2)
+    def unique(
+        self, input: jax.Array, **kwargs: Any
+    ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
+        return jax.numpy.unique(input, **kwargs)
 
-    def topk(self, input: mx.array, k: int) -> mx.array:
-        return -mx.sort(-mx.topk(input, k))
+    def where(self, cond: jax.Array, input1: jax.Array, input2: jax.Array) -> jax.Array:
+        return ops.where(cond, input1, input2)
+
+    def topk(self, input: jax.Array, k: int) -> jax.Array:
+        return jax.lax.top_k(input, k)[0]
 
     def multinomial(
         self,
-        probs: mx.array,
+        probs: jax.Array,
         num_samples: int,
         replacement: bool = False,
         key: int | None = None,
-    ) -> mx.array:
+    ) -> jax.Array:
         """
         Faster JAX implementation of multinomial sampling.
 
@@ -416,17 +510,17 @@ class MlxBackend(Backend[mx.array]):
             replacement: whether to sample with replacement
         """
         prng_key = self._get_prng_key(key)
-        input = mx.array(probs)
-        input = input / mx.sum(input, axis=-1, keepdims=True)
+        input = jax.numpy.asarray(probs)
+        input = input / jax.numpy.sum(input, axis=-1, keepdims=True)
         batch_size = input.shape[:-1]
-        logits = mx.log(mx.maximum(input, 1e-37))
+        logits = jax.numpy.log(jax.numpy.maximum(input, 1e-37))
 
         if replacement:
             # Use categorical directly - much faster than choice
-            samples = mx.random.categorical(
+            samples = jax.random.categorical(
+                prng_key,
                 logits,  # avoid log(0)
                 shape=batch_size + (num_samples,),
-                key=prng_key,
             )
         else:
             # TODO: This algorithm is not efficient for small num_samples
@@ -434,192 +528,149 @@ class MlxBackend(Backend[mx.array]):
 
             # For without replacement, use Gumbel-max trick
             # This is much faster than using choice
-            z = mx.random.gumbel(shape=input.shape + (num_samples,), key=prng_key)  # type: ignore
+            z = jax.random.gumbel(prng_key, shape=input.shape + (num_samples,))
             # Add log probabilities for Gumbel-max trick,
             z = z + logits[..., None]
             # Get top k indices
-            samples = mx.argsort(-z, axis=input.ndim - 1)[..., :num_samples, 0]
+            samples = jax.numpy.argsort(-z, axis=input.ndim - 1)[..., :num_samples, 0]
 
         return samples
 
     def clip(
         self,
-        input: mx.array,
-        min: mx.array | StaticScalar,
-        max: mx.array | StaticScalar,
-    ) -> mx.array:
-        return mx.clip(input, min, max)
+        input: jax.Array,
+        min: jax.Array | StaticScalar,
+        max: jax.Array | StaticScalar,
+    ) -> jax.Array:
+        return input.clip(min=min, max=max)
 
-    def jit[**P, T](self, fn: Callable[P, T]) -> Callable[P, T]:
-        return fn
+    def jit(  # type: ignore[override]
+        self, *args: Any, **kwargs: Any
+    ) -> Callable[..., jax.Array | tuple[jax.Array, ...]] | dict[str, jax.Array]:
+        return jax.jit(*args, **kwargs)
 
     def grad(
-        self, fn: Callable[..., dict[str, mx.array]]
-    ) -> Callable[..., dict[str, mx.array]]:
-        return mx.grad(fn)
+        self, fn: Callable[..., dict[str, jax.Array]]
+    ) -> Callable[..., dict[str, jax.Array]]:
+        return jax.grad(fn)
 
     def value_and_grad(
-        self, fn: Callable[..., dict[str, mx.array]]
-    ) -> Callable[..., tuple[dict[str, mx.array], dict[str, mx.array]]]:
-        return mx.value_and_grad(fn)
+        self, fn: Callable[..., dict[str, jax.Array]]
+    ) -> Callable[..., tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+        return jax.value_and_grad(fn)
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., tuple[Sequence[mx.array], Sequence[mx.array]]],
-        primals: list[mx.array],
+        fn: Callable[..., tuple[Sequence[jax.Array], Sequence[jax.Array]]],
+        primals: list[jax.Array],
         *,
-        cotangents: tuple[mx.array, ...],
+        cotangents: tuple[jax.Array, ...],
         has_aux: bool = True,
-    ) -> tuple[Sequence[mx.array], list[mx.array], Sequence[mx.array]]: ...
+    ) -> tuple[Sequence[jax.Array], list[jax.Array], Sequence[jax.Array]]: ...
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., tuple[dict[str, mx.array], dict[str, mx.array]]],
-        primals: dict[str, mx.array],
+        fn: Callable[..., tuple[dict[str, jax.Array], dict[str, jax.Array]]],
+        primals: dict[str, jax.Array],
         *,
-        cotangents: dict[str, mx.array],
+        cotangents: dict[str, jax.Array],
         has_aux: bool = True,
-    ) -> tuple[dict[str, mx.array], dict[str, mx.array], dict[str, mx.array]]: ...
+    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array], dict[str, jax.Array]]: ...
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., Sequence[mx.array]],
-        primals: list[mx.array],
+        fn: Callable[..., Sequence[jax.Array]],
+        primals: list[jax.Array],
         *,
-        cotangents: tuple[mx.array, ...],
+        cotangents: tuple[jax.Array, ...],
         has_aux: bool = False,
-    ) -> tuple[Sequence[mx.array], list[mx.array], Sequence[mx.array]]: ...
+    ) -> tuple[Sequence[jax.Array], list[jax.Array], Sequence[jax.Array]]: ...
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., dict[str, mx.array]],
-        primals: dict[str, mx.array],
+        fn: Callable[..., dict[str, jax.Array]],
+        primals: dict[str, jax.Array],
         *,
-        cotangents: dict[str, mx.array],
+        cotangents: dict[str, jax.Array],
         has_aux: bool = False,
-    ) -> tuple[dict[str, mx.array], dict[str, mx.array], dict[str, mx.array]]: ...
+    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array], dict[str, jax.Array]]: ...
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., Sequence[mx.array]],
-        primals: list[mx.array],
+        fn: Callable[..., Sequence[jax.Array]],
+        primals: list[jax.Array],
         *,
         cotangents: None,
         has_aux: bool = False,
-    ) -> tuple[Sequence[mx.array], Callable[..., Any], Sequence[mx.array]]: ...
+    ) -> tuple[Sequence[jax.Array], Callable[..., Any], Sequence[jax.Array]]: ...
 
     @overload
     def vjp(
         self,
-        fn: Callable[..., dict[str, mx.array]],
-        primals: dict[str, mx.array],
+        fn: Callable[..., dict[str, jax.Array]],
+        primals: dict[str, jax.Array],
         *,
         cotangents: None,
         has_aux: bool = False,
-    ) -> tuple[dict[str, mx.array], Callable[..., Any], dict[str, mx.array]]: ...
+    ) -> tuple[dict[str, jax.Array], Callable[..., Any], dict[str, jax.Array]]: ...
 
     def vjp(
         self,
         fn: Callable[
             ...,
-            dict[str, mx.array]
-            | Sequence[mx.array]
-            | tuple[Sequence[mx.array], Sequence[mx.array]]
-            | tuple[dict[str, mx.array], dict[str, mx.array]],
+            dict[str, jax.Array]
+            | Sequence[jax.Array]
+            | tuple[Sequence[jax.Array], Sequence[jax.Array]]
+            | tuple[dict[str, jax.Array], dict[str, jax.Array]],
         ],
-        primals: dict[str, mx.array] | list[mx.array],
+        primals: dict[str, jax.Array] | list[jax.Array],
         *,
-        cotangents: dict[str, mx.array] | tuple[mx.array, ...] | None = None,
+        cotangents: dict[str, jax.Array] | tuple[jax.Array, ...] | None = None,
         has_aux: bool = False,
     ) -> tuple[
-        dict[str, mx.array] | Sequence[mx.array] | mx.array,
-        dict[str, mx.array] | list[mx.array] | Callable[..., Any],
-        dict[str, mx.array] | Sequence[mx.array] | mx.array,
+        dict[str, jax.Array] | Sequence[jax.Array] | jax.Array,
+        dict[str, jax.Array] | list[jax.Array] | Callable[..., Any],
+        dict[str, jax.Array] | Sequence[jax.Array] | jax.Array,
     ]:
-        if cotangents is None:
-            raise ValueError("VJP with None cotangents is not supported.")
-        _cotangents: list[mx.array] | tuple[mx.array, ...]
-        output: dict[str, mx.array] | list[mx.array] | mx.array
-        aux: dict[str, mx.array] | list[mx.array] | mx.array
-        vjp: dict[str, mx.array] | list[mx.array]
-        # This method handles both dict and list type arguments and return.
-        if isinstance(primals, dict):
-            assert isinstance(cotangents, dict)
-            keys: list[str] = []
-            _fn = partial(
-                self._handle_dict_type_fun,
-                keys=list(primals.keys()),
-                cotangent_keys=list(cotangents.keys()),
-                fn=fn,
-                output_keys=keys,
-                has_aux=has_aux,
-            )
-            _primals = list(primals.values())
-            _cotangents = list(cotangents.values())
+        _primals: (
+            list[jax.Array | dict[str, jax.Array]] | dict[str, jax.Array] | jax.Array
+        ) = primals  # type: ignore
+        if isinstance(primals, dict | jax.Array):
+            _primals = [primals]
+        output, vjp, *aux = jax.vjp(fn, *_primals, has_aux=has_aux)  # type: ignore
+        if has_aux:
+            (aux,) = aux
         else:
-            assert isinstance(cotangents, Sequence | mx.array)
-            _fn = partial(
-                self._handle_sequence_type_fun,
-                cotangents=cotangents,
-                fn=fn,
-                has_aux=has_aux,
-            )
-            _primals = primals
-            _cotangents = cotangents
-            if isinstance(cotangents, mx.array):
-                _cotangents = [cotangents]
-            else:
-                _cotangents = list(cotangents)
-        # Calculate VJP.
-        out_list, vjp_list = mx.vjp(_fn, _primals, _cotangents)
-
-        if isinstance(primals, dict):
-            # Revert to dict representation
-            output = {
-                key: value
-                for key, value in zip(
-                    keys[: len(cotangents)], out_list[: len(cotangents)], strict=False
-                )
-            }
-            aux = {
-                key: value
-                for key, value in zip(
-                    keys[len(cotangents) :], out_list[len(cotangents) :], strict=False
-                )
-            }
-            vjp = {
-                key: value
-                for key, value in zip(list(primals.keys()), vjp_list, strict=False)
-            }
-        else:
-            # Preserve original output type if it is a single array.
-            if isinstance(cotangents, mx.array):
-                output = out_list[0]
-                aux = []
-            else:
-                output = out_list[: len(cotangents)]
-                aux = out_list[len(cotangents) :]
-                # Preserve original aux type if it is a single array.
-                aux = aux[0] if len(aux) == 1 else aux
-            vjp = vjp_list
-
+            aux = {} if isinstance(cotangents, dict) else []
+        if cotangents is not None:
+            vjp = vjp(cotangents)
+            if isinstance(cotangents, dict):
+                # JAX vjp returns tuple[dict] for dict type returns.
+                # So we should unpack vjp result.
+                (vjp,) = vjp
         return output, vjp, aux
 
-    def vmap(  # type: ignore  #mypy bug
-        self, fn: Callable[[mx.array], mx.array]
-    ) -> Callable[[mx.array], mx.array]:
-        return mx.vmap(fn)
+    def vmap(  # type: ignore # mypy bug
+        self, fn: Callable[..., dict[str, jax.Array]]
+    ) -> Callable[..., dict[str, jax.Array]]:
+        return jax.vmap(fn)
+
+    def jacrev(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        return jax.jacrev(fn)
+
+    def jacfwd(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        return jax.jacfwd(fn)
 
     def _process_dtype(
         self,
         dtype: Dtype | None = None,
         default_type: str | None = None,
-    ) -> mx.Dtype:
+    ) -> jax.numpy.dtype[Any]:
         if isinstance(dtype, Dtype):
             return utils.dtype_map[dtype.name]
         elif dtype is None:
@@ -629,12 +680,15 @@ class MlxBackend(Backend[mx.array]):
         else:
             raise ValueError(f"Invalid dtype {dtype}")
 
-    def _get_prng_key(self, key: int | None) -> mx.array:
+    def _get_prng_key(self, key: int | None = None) -> jax.Array:
         if key is None:
             _key = self.prng_key
-            self.prng_key, _ = mx.random.split(_key)
+            self.prng_key, _ = jax.random.split(_key)
             return _key
-        return mx.random.key(key)
+        return jax.random.PRNGKey(key)
+
+    def _get_defualt_type(self) -> jax.numpy.dtype[Any]:
+        return getattr(self, self._dtype.name)
 
     def _get_default_subtype(self) -> str:
         return DtypeSubTypes[self._dtype.name].value
